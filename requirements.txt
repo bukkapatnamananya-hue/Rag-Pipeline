@@ -5,3 +5,5 @@ psycopg2-binary
 pgvector
 python-dotenv
 pydantic-settings
+unstructured[pdf]
+langchain
