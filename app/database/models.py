@@ -1,5 +1,5 @@
 from datetime import datetime
-
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import DateTime, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -9,6 +9,10 @@ class Base(DeclarativeBase):
 
 
 class KnowledgeChunk(Base):
+    embedding: Mapped[list[float] | None] = mapped_column(
+    Vector(384),
+    nullable=True
+)
     __tablename__ = "knowledge_chunks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

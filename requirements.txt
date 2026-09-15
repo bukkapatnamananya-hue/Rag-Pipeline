@@ -7,3 +7,6 @@ python-dotenv
 pydantic-settings
 unstructured[pdf]
 langchain
+sentence-transformers
+langchain-core
+langchain-text-splitters
