@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
+
+# Generated RAG data
+data/raw/
+data/processed/
+data/chunks/
+data/embeddings/
+data/comparison/
