@@ -13,6 +13,7 @@ class KnowledgeChunk(Base):
     Vector(384),
     nullable=True
 )
+
     __tablename__ = "knowledge_chunks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -25,6 +26,10 @@ class KnowledgeChunk(Base):
         String(255),
         nullable=True
     )
+    strategy: Mapped[str] = mapped_column(
+    String(50),
+    nullable=False
+)
 
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
@@ -42,6 +47,10 @@ class KnowledgeChunk(Base):
         String(500),
         nullable=True
     )
+    strategy: Mapped[str] = mapped_column(
+    String(50),
+    nullable=False
+)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

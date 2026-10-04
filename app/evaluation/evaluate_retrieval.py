@@ -1,0 +1,1 @@
+I dont want details about how the frontend was made,I want you to focus more on ingestion,chunking,embeddings,similarity search,databse and retrival and our overall system architecture along with the different metrices

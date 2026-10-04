@@ -1,11 +1,17 @@
 from pathlib import Path
 import json
+import argparse
 
 from unstructured.partition.pdf import partition_pdf
 
 
-PDF_PATH = Path("data/raw/annual_report_zen_technologies_fy24.pdf")
-OUTPUT_PATH = Path("data/processed/unstructured_elements.json")
+DEFAULT_PDF_PATH = Path(
+    "data/raw/annual_report_zen_technologies_fy24.pdf"
+)
+
+OUTPUT_PATH = Path(
+    "data/processed/unstructured_elements.json"
+)
 
 
 def extract_pdf(pdf_path: Path):
@@ -44,9 +50,24 @@ def element_to_dict(element, index: int):
 
 def main():
 
-    print(f"Reading PDF: {PDF_PATH}")
+    parser = argparse.ArgumentParser(
+        description="Extract elements from a PDF using Unstructured."
+    )
 
-    elements = extract_pdf(PDF_PATH)
+    parser.add_argument(
+        "--file",
+        type=str,
+        default=str(DEFAULT_PDF_PATH),
+        help="Path to the PDF file to process."
+    )
+
+    args = parser.parse_args()
+
+    pdf_path = Path(args.file)
+
+    print(f"Reading PDF: {pdf_path}")
+
+    elements = extract_pdf(pdf_path)
 
     print(f"Extracted {len(elements)} elements")
 
