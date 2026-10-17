@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 from pathlib import Path
@@ -14,16 +15,31 @@ EMBEDDING_FILES = [
     BASE_DIR / "data" / "embeddings" / "contextual_embeddings.json",
 ]
 
-DOCUMENT_NAME = "annual_report_zen_technologies_fy24.pdf"
+
+def normalize_document_name(value):
+    text = str(value or "document").strip()
+    text = text.replace("\\", "/").split("/")[-1]
+    text = text.rsplit(".", 1)[0]
+    text = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text)
+    return text or "document"
 
 
-async def load_embeddings():
+def resolve_document_name(file_path: Path, override: str | None = None) -> str:
+    if override:
+        return override
+
+    stem = file_path.stem.replace("_embeddings", "")
+    return normalize_document_name(stem)
+
+
+async def load_embeddings(document_name: str | None = None):
     total_loaded = 0
 
     async with SessionLocal() as session:
         for file_path in EMBEDDING_FILES:
-            print(f"\nLoading: {file_path.name}")
+            actual_document_name = resolve_document_name(file_path, document_name)
 
+            print(f"\nLoading: {file_path.name}")
             with open(file_path, "r", encoding="utf-8") as f:
                 chunks = json.load(f)
 
@@ -31,8 +47,8 @@ async def load_embeddings():
 
             for chunk in chunks:
                 knowledge_chunk = KnowledgeChunk(
-                    document_id=chunk["document_id"],
-                    document_name=DOCUMENT_NAME,
+                    document_id=chunk.get("document_id", actual_document_name),
+                    document_name=actual_document_name,
                     chunk_id=chunk["chunk_id"],
                     parent_chunk_id=None,
                     content=chunk["text"],
@@ -54,4 +70,13 @@ async def load_embeddings():
 
 
 if __name__ == "__main__":
-    asyncio.run(load_embeddings())
+    parser = argparse.ArgumentParser(description="Load chunk embeddings into PostgreSQL.")
+    parser.add_argument(
+        "--document-name",
+        type=str,
+        default=None,
+        help="Optional document name to label chunks with. Defaults to the embedding file name.",
+    )
+    args = parser.parse_args()
+
+    asyncio.run(load_embeddings(args.document_name))

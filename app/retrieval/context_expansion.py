@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from app.database.connection import engine
 from app.database.models import KnowledgeChunk
@@ -31,6 +31,7 @@ async def expand_context(
         return []
 
     expanded_chunk_ids = set()
+    original_chunks = {}
 
     # Determine neighboring chunks dynamically from the
     # chunk IDs returned by retrieval.
@@ -38,9 +39,17 @@ async def expand_context(
 
         chunk_id = chunk["chunk_id"]
         strategy = chunk["strategy"]
+        document_id = chunk.get("document_id")
 
-        prefix, number = chunk_id.rsplit("_", 1)
-        target_index = int(number)
+        original_key = (document_id, strategy, chunk_id)
+        original_chunks[original_key] = chunk
+        expanded_chunk_ids.add(original_key)
+
+        try:
+            prefix, number = chunk_id.rsplit("_", 1)
+            target_index = int(number)
+        except (AttributeError, ValueError):
+            continue
 
         start_index = max(0, target_index - window)
         end_index = target_index + window
@@ -49,6 +58,7 @@ async def expand_context(
 
             expanded_chunk_ids.add(
                 (
+                    document_id,
                     strategy,
                     f"{prefix}_{index}"
                 )
@@ -58,21 +68,26 @@ async def expand_context(
     # without making assumptions about the document.
     conditions = []
 
-    for strategy, chunk_id in expanded_chunk_ids:
+    for document_id, strategy, chunk_id in expanded_chunk_ids:
+
+        conditions_for_chunk = [
+            KnowledgeChunk.strategy == strategy,
+            KnowledgeChunk.chunk_id == chunk_id,
+        ]
+
+        if document_id is not None:
+            conditions_for_chunk.append(
+                KnowledgeChunk.document_id == document_id
+            )
 
         conditions.append(
-            (
-                KnowledgeChunk.strategy == strategy,
-                KnowledgeChunk.chunk_id == chunk_id
-            )
+            and_(*conditions_for_chunk)
         )
 
     if not conditions:
         return []
 
     async with engine.connect() as connection:
-
-        from sqlalchemy import or_, and_
 
         query = (
             select(
@@ -88,12 +103,8 @@ async def expand_context(
                 KnowledgeChunk.section
             )
             .where(
-                or_(
-                    and_(*condition)
-                    for condition in conditions
-                )
+                or_(*conditions)
             )
-            .order_by(KnowledgeChunk.id)
         )
 
         result = await connection.execute(query)
@@ -103,6 +114,9 @@ async def expand_context(
     expanded_chunks = []
 
     for row in rows:
+
+        original_key = (row[1], row[5], row[3])
+        original = original_chunks.get(original_key, {})
 
         expanded_chunks.append(
             {
@@ -115,9 +129,34 @@ async def expand_context(
                 "content": row[6],
                 "summary": row[7],
                 "page_number": row[8],
-                "section": row[9]
+                "section": row[9],
+                **{
+                    key: value
+                    for key, value in original.items()
+                    if key not in {
+                        "id", "document_id", "document_name", "chunk_id",
+                        "parent_chunk_id", "strategy", "content", "summary",
+                        "page_number", "section",
+                    }
+                },
             }
         )
+
+    def chunk_order(chunk):
+        chunk_id = chunk["chunk_id"]
+        prefix, separator, suffix = chunk_id.rpartition("_")
+
+        if separator and suffix.isdigit():
+            return (
+                chunk["document_id"],
+                chunk["strategy"],
+                prefix,
+                int(suffix),
+            )
+
+        return (chunk["document_id"], chunk["strategy"], chunk_id, -1)
+
+    expanded_chunks.sort(key=chunk_order)
 
     return expanded_chunks
 

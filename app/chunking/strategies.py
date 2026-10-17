@@ -1,25 +1,62 @@
+import hashlib
 import json
 from pathlib import Path
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-INPUT_PATH = Path(
-    "data/processed/cleaned_elements.json"
-)
+INPUT_PATH = Path("data/processed/cleaned_elements.json")
+OUTPUT_DIR = Path("data/chunks")
 
-OUTPUT_DIR = Path(
-    "data/chunks"
-)
+
+def normalize_document_name(value):
+    """Convert a file name or title to a safe, reusable document identifier."""
+    text = str(value or "document").strip()
+    text = text.replace("\\", "/").split("/")[-1]
+    text = text.rsplit(".", 1)[0]
+    text = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text)
+    return text or "document"
+
+
+def infer_document_metadata(elements):
+    """
+    Infer a document id and title from the actual extracted content.
+    This removes all hardcoded annual-report assumptions.
+    """
+    source_name = "document"
+    title = "Uploaded Document"
+
+    for element in elements:
+        metadata = element.get("metadata") or {}
+
+        for key in ("filename", "file_name", "source_name", "source"):
+            candidate = metadata.get(key)
+            if candidate:
+                source_name = candidate
+                break
+
+        element_type = element.get("element_type", "")
+        text = str(element.get("text", "")).strip()
+
+        if element_type in {"Title", "Header", "SectionHeader"} and text:
+            title = text
+            break
+
+        if text and len(text) > 20 and element_type in {"NarrativeText", "ListItem", "TableRow"}:
+            title = text[:80]
+            break
+
+    safe_name = normalize_document_name(source_name or title)
+    doc_hash = hashlib.sha1(f"{safe_name}:{title}".encode("utf-8")).hexdigest()[:12]
+    document_id = f"doc_{safe_name}_{doc_hash}"
+
+    return document_id, title
 
 
 def load_elements():
     """Load cleaned elements from the JSON file."""
-
     if not INPUT_PATH.exists():
-        raise FileNotFoundError(
-            f"Input file not found: {INPUT_PATH.resolve()}"
-        )
+        raise FileNotFoundError(f"Input file not found: {INPUT_PATH.resolve()}")
 
     with open(INPUT_PATH, "r", encoding="utf-8") as file:
         return json.load(file)
@@ -30,149 +67,112 @@ def load_elements():
 # ============================================================
 
 def recursive_chunking(elements):
-    """
-    Recursive chunking using LangChain's
-    RecursiveCharacterTextSplitter.
-
-    Related cleaned elements are first combined into larger
-    text blocks, then recursively split into manageable chunks.
-    """
+    document_id, _ = infer_document_metadata(elements)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=100,
-        separators=[
-            "\n\n",
-            "\n",
-            ". ",
-            " ",
-            ""
-        ]
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
 
     chunks = []
     chunk_index = 0
 
-    # Combine related elements into larger blocks
     current_block = []
     current_section = "General"
 
     for element in elements:
-
-        text = element["text"].strip()
-
+        text = str(element.get("text", "")).strip()
         if not text:
             continue
 
-        element_type = element["element_type"]
+        element_type = element.get("element_type", "NarrativeText")
 
-        # Section headers start a new logical block
         if element_type == "SectionHeader":
-
             if current_block:
                 block_text = "\n".join(current_block)
-
                 split_texts = splitter.split_text(block_text)
 
                 for text_chunk in split_texts:
-
-                    chunks.append({
-                        "chunk_id": f"recursive_{chunk_index}",
-                        "document_id": "zen_annual_report_fy24",
-                        "strategy": "recursive",
-                        "section": current_section,
-                        "source_element_type": "CombinedText",
-                        "chunk_index": chunk_index,
-                        "text": text_chunk,
-                        "character_count": len(text_chunk),
-                        "word_count": len(text_chunk.split())
-                    })
-
+                    chunks.append(
+                        {
+                            "chunk_id": f"recursive_{chunk_index}",
+                            "document_id": document_id,
+                            "strategy": "recursive",
+                            "section": current_section,
+                            "source_element_type": "CombinedText",
+                            "chunk_index": chunk_index,
+                            "text": text_chunk,
+                            "character_count": len(text_chunk),
+                            "word_count": len(text_chunk.split()),
+                        }
+                    )
                     chunk_index += 1
 
             current_block = []
-            current_section = element.get(
-                "section",
-                text
-            )
-
+            current_section = element.get("section") or text
             continue
 
         current_block.append(text)
 
-    # Process final block
     if current_block:
-
         block_text = "\n".join(current_block)
-
         split_texts = splitter.split_text(block_text)
 
         for text_chunk in split_texts:
-
-            chunks.append({
-                "chunk_id": f"recursive_{chunk_index}",
-                "document_id": "zen_annual_report_fy24",
-                "strategy": "recursive",
-                "section": current_section,
-                "source_element_type": "CombinedText",
-                "chunk_index": chunk_index,
-                "text": text_chunk,
-                "character_count": len(text_chunk),
-                "word_count": len(text_chunk.split())
-            })
-
+            chunks.append(
+                {
+                    "chunk_id": f"recursive_{chunk_index}",
+                    "document_id": document_id,
+                    "strategy": "recursive",
+                    "section": current_section,
+                    "source_element_type": "CombinedText",
+                    "chunk_index": chunk_index,
+                    "text": text_chunk,
+                    "character_count": len(text_chunk),
+                    "word_count": len(text_chunk.split()),
+                }
+            )
             chunk_index += 1
 
     return chunks
+
+
 # ============================================================
 # Strategy 2: Structure-Aware Chunking
 # ============================================================
 
 def structure_aware_chunking(elements):
-    """
-    Structure-aware chunking.
-
-    Uses the structure created during the cleaning stage.
-    Section headers establish context, while TableRows are
-    preserved as complete semantic units.
-    """
+    document_id, _ = infer_document_metadata(elements)
 
     chunks = []
     chunk_index = 0
-
     current_section = "General"
 
     for element in elements:
-
-        text = element["text"].strip()
-
+        text = str(element.get("text", "")).strip()
         if not text:
             continue
 
-        element_type = element["element_type"]
+        element_type = element.get("element_type", "NarrativeText")
 
-        # Section headers establish the current section
         if element_type == "SectionHeader":
-
-            current_section = element.get(
-                "section",
-                text
-            )
-
+            current_section = element.get("section") or text
             continue
 
-        chunks.append({
-            "chunk_id": f"structure_{chunk_index}",
-            "document_id": "zen_annual_report_fy24",
-            "strategy": "structure_aware",
-            "section": current_section,
-            "source_element_type": element_type,
-            "chunk_index": chunk_index,
-            "text": text,
-            "character_count": len(text),
-            "word_count": len(text.split())
-        })
-
+        chunks.append(
+            {
+                "chunk_id": f"structure_{chunk_index}",
+                "document_id": document_id,
+                "strategy": "structure_aware",
+                "section": current_section,
+                "source_element_type": element_type,
+                "chunk_index": chunk_index,
+                "text": text,
+                "character_count": len(text),
+                "word_count": len(text.split()),
+            }
+        )
         chunk_index += 1
 
     return chunks
@@ -183,43 +183,24 @@ def structure_aware_chunking(elements):
 # ============================================================
 
 def contextual_chunking(elements):
-    """
-    Contextual chunking.
-
-    Adds document-level and section-level context to every
-    semantic chunk before embedding.
-
-    This version does not require an external LLM/API.
-    """
+    document_id, title = infer_document_metadata(elements)
 
     chunks = []
     chunk_index = 0
 
-    document_context = (
-        "Document: Zen Technologies Limited Annual Report 2023-24. "
-        "The document contains corporate overview, financial performance, "
-        "business segment revenue, and research and development information."
-    )
+    document_context = f"Document: {title}. This is a generic document chunk for retrieval and indexing."
 
     current_section = "General"
 
     for element in elements:
-
-        text = element["text"].strip()
-
+        text = str(element.get("text", "")).strip()
         if not text:
             continue
 
-        element_type = element["element_type"]
+        element_type = element.get("element_type", "NarrativeText")
 
-        # Update section context
         if element_type == "SectionHeader":
-
-            current_section = element.get(
-                "section",
-                text
-            )
-
+            current_section = element.get("section") or text
             continue
 
         contextual_text = (
@@ -228,18 +209,20 @@ def contextual_chunking(elements):
             f"Content:\n{text}"
         )
 
-        chunks.append({
-            "chunk_id": f"contextual_{chunk_index}",
-            "document_id": "zen_annual_report_fy24",
-            "strategy": "contextual",
-            "section": current_section,
-            "source_element_type": element_type,
-            "chunk_index": chunk_index,
-            "text": contextual_text,
-            "original_text": text,
-            "character_count": len(contextual_text),
-            "word_count": len(contextual_text.split())
-        })
+        chunks.append(
+            {
+                "chunk_id": f"contextual_{chunk_index}",
+                "document_id": document_id,
+                "strategy": "contextual",
+                "section": current_section,
+                "source_element_type": element_type,
+                "chunk_index": chunk_index,
+                "text": contextual_text,
+                "original_text": text,
+                "character_count": len(contextual_text),
+                "word_count": len(contextual_text.split()),
+            }
+        )
 
         chunk_index += 1
 
@@ -251,30 +234,13 @@ def contextual_chunking(elements):
 # ============================================================
 
 def save_chunks(chunks, filename):
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_path = OUTPUT_DIR / filename
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8"
-    ) as file:
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(chunks, file, indent=2, ensure_ascii=False)
 
-        json.dump(
-            chunks,
-            file,
-            indent=2,
-            ensure_ascii=False
-        )
-
-    print(
-        f"Saved {len(chunks)} chunks → {output_path}"
-    )
+    print(f"Saved {len(chunks)} chunks → {output_path}")
 
 
 # ============================================================
@@ -282,76 +248,29 @@ def save_chunks(chunks, filename):
 # ============================================================
 
 def main():
-
-    print(
-        f"Reading cleaned elements from: {INPUT_PATH}"
-    )
-
+    print(f"Reading cleaned elements from: {INPUT_PATH}")
     elements = load_elements()
-
-    print(
-        f"Loaded {len(elements)} cleaned elements"
-    )
-
-    # --------------------------------------------------------
-    # Strategy 1
-    # --------------------------------------------------------
+    print(f"Loaded {len(elements)} cleaned elements")
 
     print("\nCreating recursive chunks...")
-
     recursive_chunks = recursive_chunking(elements)
-
-    save_chunks(
-        recursive_chunks,
-        "recursive_chunks.json"
-    )
-
-    # --------------------------------------------------------
-    # Strategy 2
-    # --------------------------------------------------------
+    save_chunks(recursive_chunks, "recursive_chunks.json")
 
     print("\nCreating structure-aware chunks...")
-
     structure_chunks = structure_aware_chunking(elements)
-
-    save_chunks(
-        structure_chunks,
-        "structure_aware_chunks.json"
-    )
-
-    # --------------------------------------------------------
-    # Strategy 3
-    # --------------------------------------------------------
+    save_chunks(structure_chunks, "structure_aware_chunks.json")
 
     print("\nCreating contextual chunks...")
-
     contextual_chunks = contextual_chunking(elements)
-
-    save_chunks(
-        contextual_chunks,
-        "contextual_chunks.json"
-    )
-
-    # --------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------
+    save_chunks(contextual_chunks, "contextual_chunks.json")
 
     print("\n" + "=" * 60)
     print("CHUNKING COMPLETE")
     print("=" * 60)
 
-    print(
-        f"Recursive chunks:        {len(recursive_chunks)}"
-    )
-
-    print(
-        f"Structure-aware chunks:  {len(structure_chunks)}"
-    )
-
-    print(
-        f"Contextual chunks:       {len(contextual_chunks)}"
-    )
-
+    print(f"Recursive chunks:        {len(recursive_chunks)}")
+    print(f"Structure-aware chunks:  {len(structure_chunks)}")
+    print(f"Contextual chunks:       {len(contextual_chunks)}")
     print("=" * 60)
 
 

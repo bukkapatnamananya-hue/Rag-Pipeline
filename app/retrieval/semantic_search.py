@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from sqlalchemy import select
 
@@ -11,7 +12,8 @@ from app.embeddings.model import create_embedding
 async def semantic_search(
     query: str,
     top_k: int = 15,
-    strategy: str | None = None
+    strategy: str | None = None,
+    return_metadata: bool = False,
 ):
     """
     Convert the query into an embedding and retrieve
@@ -22,25 +24,20 @@ async def semantic_search(
         top_k: Number of candidate chunks to retrieve.
         strategy: Optional chunking strategy filter.
                   Examples: recursive, structure_aware, contextual.
+        return_metadata: When True, return (results, metadata) instead
+                         of only the retrieved list.
     """
 
-    # ---------------------------------------------------------
-    # 1. Convert the user query into a 384-dimensional embedding
-    # ---------------------------------------------------------
+    embedding_start = time.perf_counter()
     query_embedding = create_embedding(query)
+    embedding_elapsed_ms = (time.perf_counter() - embedding_start) * 1000.0
 
+    search_start = time.perf_counter()
     async with SessionLocal() as session:
-
-        # -----------------------------------------------------
-        # 2. Calculate cosine distance using pgvector
-        # -----------------------------------------------------
         distance = KnowledgeChunk.embedding.cosine_distance(
             query_embedding
         )
 
-        # -----------------------------------------------------
-        # 3. Build the semantic search query
-        # -----------------------------------------------------
         statement = (
             select(
                 KnowledgeChunk,
@@ -50,38 +47,45 @@ async def semantic_search(
             .limit(top_k)
         )
 
-        # -----------------------------------------------------
-        # 4. Optionally search only one chunking strategy
-        # -----------------------------------------------------
         if strategy:
             statement = statement.where(
                 KnowledgeChunk.strategy == strategy
             )
 
-        # -----------------------------------------------------
-        # 5. Execute search
-        # -----------------------------------------------------
         result = await session.execute(statement)
-
         rows = result.all()
 
-    # ---------------------------------------------------------
-    # 6. Format the retrieved chunks
-    # ---------------------------------------------------------
+    search_elapsed_ms = (time.perf_counter() - search_start) * 1000.0
+
     results = []
 
     for chunk, distance_value in rows:
-
         distance_value = float(distance_value)
-
         results.append({
+            "id": chunk.id,
+            "document_id": chunk.document_id,
+            "document_name": chunk.document_name,
             "chunk_id": chunk.chunk_id,
+            "parent_chunk_id": chunk.parent_chunk_id,
             "strategy": chunk.strategy,
             "section": chunk.section,
+            "page_number": chunk.page_number,
+            "summary": chunk.summary,
             "content": chunk.content,
             "distance": distance_value,
             "similarity": 1 - distance_value,
         })
+
+    metadata = {
+        "query_embedding_time_ms": embedding_elapsed_ms,
+        "semantic_search_time_ms": search_elapsed_ms,
+        "total_retrieval_time_ms": embedding_elapsed_ms + search_elapsed_ms,
+        "top_k": top_k,
+        "strategy": strategy,
+    }
+
+    if return_metadata:
+        return results, metadata
 
     return results
 

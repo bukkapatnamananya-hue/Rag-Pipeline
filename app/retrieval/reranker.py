@@ -1,37 +1,20 @@
 import asyncio
-
 from sentence_transformers import CrossEncoder
 
 from app.retrieval.semantic_search import semantic_search
+from app.retrieval.context_expansion import expand_context
 
 
-# Cross-encoder reranking model
 MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
 reranker = CrossEncoder(MODEL_NAME)
 
 
-def rerank_results(
-    query: str,
-    results: list[dict],
-    top_k: int = 5
-):
-    """
-    Rerank semantic-search results using a cross-encoder.
-
-    The cross-encoder directly evaluates:
-        query + chunk
-
-    and produces a relevance score.
-    """
+def rerank_results(query: str, results: list[dict], top_k: int = 5):
 
     if not results:
         return []
 
-    pairs = [
-        (query, result["content"])
-        for result in results
-    ]
+    pairs = [(query, result["content"]) for result in results]
 
     scores = reranker.predict(pairs)
 
@@ -42,7 +25,6 @@ def rerank_results(
         result_copy["rerank_score"] = float(score)
         reranked_results.append(result_copy)
 
-    # Highest score = most relevant
     reranked_results.sort(
         key=lambda x: x["rerank_score"],
         reverse=True
@@ -53,15 +35,8 @@ def rerank_results(
 
 async def main():
 
-    query = "What was Zen Technologies EBITDA in FY 2023-24?"
+    query = input("`nEnter your question: ").strip()
 
-    print("\n" + "=" * 80)
-    print("SEMANTIC RETRIEVAL + RERANKING")
-    print("=" * 80)
-
-    print(f"\nQuery: {query}")
-
-    # Test each chunking strategy separately
     strategies = [
         "recursive",
         "structure_aware",
@@ -70,45 +45,57 @@ async def main():
 
     for strategy in strategies:
 
-        print("\n" + "=" * 80)
+        print("`n" + "=" * 80)
         print(f"STRATEGY: {strategy}")
         print("=" * 80)
 
-        # Step 1: Retrieve top 15 candidates using semantic search
         results = await semantic_search(
             query=query,
             top_k=15,
             strategy=strategy
         )
 
-        print(
-            f"\nSemantic candidates retrieved: {len(results)}"
-        )
+        print(f"`nSemantic candidates retrieved: {len(results)}")
 
-        # Step 2: Rerank the 15 candidates
         reranked = rerank_results(
             query=query,
             results=results,
             top_k=5
         )
 
-        print("\nTOP 5 RERANKED RESULTS")
+        print("`nTOP 5 RERANKED RESULTS")
         print("=" * 80)
 
-        # Step 3: Display the top 5 results
         for i, result in enumerate(reranked, start=1):
 
-            print(f"\nRESULT {i}")
+            print(f"`nRESULT {i}")
             print("-" * 80)
-
             print(f"Chunk ID       : {result['chunk_id']}")
             print(f"Strategy       : {result['strategy']}")
             print(f"Semantic Score : {result['similarity']:.4f}")
             print(f"Rerank Score   : {result['rerank_score']:.4f}")
             print(f"Section        : {result['section']}")
-
-            print("\nContent:")
+            print("`nContent:")
             print(result["content"])
+
+        expanded_context = await expand_context(
+            reranked,
+            window=2
+        )
+
+        print("`nEXPANDED CONTEXT")
+        print("=" * 80)
+        print(f"`nExpanded chunks retrieved: {len(expanded_context)}")
+
+        for i, chunk in enumerate(expanded_context, start=1):
+
+            print(f"`nCONTEXT {i}")
+            print("-" * 80)
+            print(f"Chunk ID : {chunk['chunk_id']}")
+            print(f"Strategy : {chunk['strategy']}")
+            print(f"Section  : {chunk['section']}")
+            print("`nContent:")
+            print(chunk["content"])
 
 
 if __name__ == "__main__":

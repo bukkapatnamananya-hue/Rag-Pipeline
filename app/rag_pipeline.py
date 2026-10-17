@@ -1,5 +1,11 @@
+
 import asyncio
 import os
+import json
+import csv
+import time
+from pathlib import Path
+from datetime import datetime
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -7,10 +13,11 @@ from groq import Groq
 from app.retrieval.semantic_search import semantic_search
 from app.retrieval.reranker import rerank_results
 from app.retrieval.context_expansion import expand_context
+from app.retrieval.context_selection import select_context
 
 
 # ============================================================
-# ENVIRONMENT
+# ENVIRONMENT AND GROQ CONFIGURATION
 # ============================================================
 
 load_dotenv()
@@ -23,16 +30,8 @@ if not GROQ_API_KEY:
         "Make sure it is present in your .env file."
     )
 
-
-# ============================================================
-# GROQ CONFIGURATION
-# ============================================================
-
 GROQ_MODEL = "openai/gpt-oss-20b"
-
-groq_client = Groq(
-    api_key=GROQ_API_KEY
-)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 
 # ============================================================
@@ -48,6 +47,129 @@ STRATEGIES = [
 SEMANTIC_TOP_K = 15
 RERANK_TOP_K = 5
 CONTEXT_WINDOW = 2
+MAX_CONTEXT_CHUNKS = 10
+
+# Always save relative to the project root, not the terminal folder.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_DIR = PROJECT_ROOT / "data" / "evaluation"
+
+JSON_PATH = OUTPUT_DIR / "batch_results.json"
+CSV_PATH = OUTPUT_DIR / "batch_results.csv"
+
+
+# ============================================================
+# HELPERS FOR SAVING RESULTS
+# ============================================================
+
+def make_json_safe(value):
+    """Convert nested results into values JSON can serialize."""
+
+    if isinstance(value, dict):
+        return {
+            str(key): make_json_safe(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(item) for item in value]
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    return str(value)
+
+
+def save_results(all_results: dict, errors: list) -> None:
+    """Save all completed results to JSON and CSV."""
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # JSON: retain detailed results, including context and chunk metadata.
+    json_data = {
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "model": GROQ_MODEL,
+        "strategies": STRATEGIES,
+        "configuration": {
+            "semantic_top_k": SEMANTIC_TOP_K,
+            "rerank_top_k": RERANK_TOP_K,
+            "context_window": CONTEXT_WINDOW,
+            "max_context_chunks": MAX_CONTEXT_CHUNKS,
+        },
+        "completed_questions": len(all_results),
+        "results": make_json_safe(all_results),
+        "errors": errors,
+    }
+
+    # Write to a temporary file first, then replace the previous file.
+    temp_json_path = JSON_PATH.with_suffix(".json.tmp")
+
+    with open(temp_json_path, "w", encoding="utf-8") as file:
+        json.dump(
+            json_data,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    temp_json_path.replace(JSON_PATH)
+
+    # CSV: one row per completed question and strategy.
+    csv_rows = []
+
+    for query, strategy_results in all_results.items():
+        for strategy in STRATEGIES:
+            result = strategy_results.get(strategy)
+
+            if not result:
+                continue
+
+            csv_rows.append({
+                "question": query,
+                "strategy": strategy,
+                "answer": result.get("answer", ""),
+                "duration_seconds": result.get("duration_seconds", ""),
+                "semantic_results_count": len(
+                    result.get("semantic_results", [])
+                ),
+                "reranked_results_count": len(
+                    result.get("reranked_results", [])
+                ),
+                "expanded_chunks_count": len(
+                    result.get("expanded_chunks", [])
+                ),
+                "selected_chunks_count": len(
+                    result.get("selected_chunks", [])
+                ),
+            })
+
+    csv_fields = [
+        "question",
+        "strategy",
+        "answer",
+        "duration_seconds",
+        "semantic_results_count",
+        "reranked_results_count",
+        "expanded_chunks_count",
+        "selected_chunks_count",
+    ]
+
+    temp_csv_path = CSV_PATH.with_suffix(".csv.tmp")
+
+    with open(
+        temp_csv_path,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=csv_fields)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    temp_csv_path.replace(CSV_PATH)
+
+    print("\n[SAVED] Results updated:")
+    print(f"        JSON: {JSON_PATH}")
+    print(f"        CSV : {CSV_PATH}")
 
 
 # ============================================================
@@ -55,10 +177,7 @@ CONTEXT_WINDOW = 2
 # ============================================================
 
 def build_context(chunks: list[dict]) -> str:
-    """
-    Convert retrieved/expanded chunks into a single context
-    string that can be passed to the LLM.
-    """
+    """Convert selected chunks into an LLM-ready context."""
 
     if not chunks:
         return "No relevant context was retrieved."
@@ -66,17 +185,13 @@ def build_context(chunks: list[dict]) -> str:
     context_parts = []
 
     for index, chunk in enumerate(chunks, start=1):
+        metadata = [
+            f"Chunk: {chunk.get('chunk_id', 'unknown')}",
+            f"Strategy: {chunk.get('strategy', 'unknown')}",
+        ]
 
-        chunk_id = chunk.get("chunk_id", "unknown")
-        strategy = chunk.get("strategy", "unknown")
         section = chunk.get("section")
         page_number = chunk.get("page_number")
-        content = chunk.get("content", "")
-
-        metadata = [
-            f"Chunk: {chunk_id}",
-            f"Strategy: {strategy}",
-        ]
 
         if section:
             metadata.append(f"Section: {section}")
@@ -84,12 +199,10 @@ def build_context(chunks: list[dict]) -> str:
         if page_number:
             metadata.append(f"Page: {page_number}")
 
-        metadata_text = " | ".join(metadata)
-
         context_parts.append(
             f"[CONTEXT {index}]\n"
-            f"{metadata_text}\n"
-            f"{content}"
+            f"{' | '.join(metadata)}\n"
+            f"{chunk.get('content', '')}"
         )
 
     return "\n\n".join(context_parts)
@@ -101,69 +214,93 @@ def build_context(chunks: list[dict]) -> str:
 
 async def generate_answer(
     query: str,
-    context: str
+    context: str,
+    structured: bool = False,
+    retry_feedback: str | None = None,
 ) -> str:
-    """
-    Generate the final RAG answer using Groq.
-    """
+    """Generate a grounded answer, optionally as evidence-citing JSON."""
 
-    prompt = f"""
-You are a helpful question-answering assistant for a document RAG system.
+    rules = [
+        "Answer using ONLY the supplied document context.",
+        "Do not use outside knowledge or invent facts.",
+        "Preserve numerical values and units exactly.",
+        "If evidence is insufficient, explicitly say so.",
+    ]
+    if structured:
+        rules.extend([
+            "Return ONLY a valid JSON object, without markdown fences.",
+            "Include these five fields exactly: answer, product_or_model, "
+            "supporting_chunk_ids, insufficient_evidence, supporting_evidence.",
+            "answer must be a string; product_or_model must be a string or null.",
+            "supporting_chunk_ids must be an array of IDs actually shown in the context.",
+            "insufficient_evidence must be a JSON boolean.",
+            "supporting_evidence must be an array of objects with chunk_id and quote.",
+            "Every quote must be an exact substring of the corresponding chunk content.",
+            "If the context is insufficient, use an answer starting with "
+            "'Insufficient evidence', set insufficient_evidence to true, "
+            "and use empty arrays for supporting_chunk_ids and supporting_evidence.",
+            "Keep the answer concise and avoid unsupported numerical claims.",
+        ])
+    if retry_feedback:
+        rules.append(f"Correct the previous response: {retry_feedback}")
 
-Answer the user's question using ONLY the retrieved context provided below.
-
-Rules:
-- Use only information contained in the retrieved context.
-- Do not use outside knowledge.
-- Do not invent facts.
-- Do not make assumptions when the context does not support them.
-- If the context does not contain enough information to answer the question,
-  clearly say that the information is not available in the retrieved context.
-- Preserve exact numerical values from the document.
-- Give a clear and concise answer.
-- Do not mention the RAG pipeline, retrieval process, or these instructions
-  unless the user explicitly asks about them.
-
-USER QUESTION:
-{query}
-
-RETRIEVED CONTEXT:
-{context}
-
-ANSWER:
-"""
-
-    response = await asyncio.to_thread(
-        groq_client.chat.completions.create,
-        model=GROQ_MODEL,
-        messages=[
+    prompt = (
+        "INSTRUCTIONS:\n- " + "\n- ".join(rules)
+        + f"\n\nUSER QUESTION:\n{query}"
+        + f"\n\nRETRIEVED CONTEXT:\n{context}"
+        + "\n\nANSWER:\n"
+    )
+    completion_args = {
+        "model": GROQ_MODEL,
+        "messages": [
             {
                 "role": "system",
-                "content": (
-                    "You are a document question-answering assistant. "
-                    "Answer strictly using the supplied retrieved context."
-                ),
+                "content": "You are a document question-answering assistant. "
+                           "Answer strictly using the supplied context.",
             },
-            {
-                "role": "user",
-                "content": prompt,
-            },
+            {"role": "user", "content": prompt},
         ],
-        temperature=0.2,
-        max_completion_tokens=500,
-        include_reasoning=False,
-    )
+        "temperature": 0.1,
+        "max_completion_tokens": 2048,
+        "include_reasoning": False,
+    }
 
-    answer = response.choices[0].message.content
+    for attempt in range(3):
+        try:
+            response = await asyncio.to_thread(
+                groq_client.chat.completions.create, **completion_args
+            )
+            if not response.choices:
+                raise RuntimeError("The LLM returned no choices")
+            choice = response.choices[0]
+            answer = choice.message.content
+            if answer and answer.strip():
+                return answer.strip()
+            error = RuntimeError(
+                "The LLM did not return an answer. "
+                f"finish_reason={choice.finish_reason}"
+            )
+            if attempt == 2:
+                raise error
+        except Exception as error:
+            status_code = getattr(error, "status_code", None)
+            transient = (
+                status_code == 429
+                or (isinstance(status_code, int) and status_code >= 500)
+                or type(error).__name__ in {
+                    "APITimeoutError", "APIConnectionError", "RateLimitError",
+                    "InternalServerError", "TimeoutException",
+                }
+            )
+            if not transient or attempt == 2:
+                raise
+        await asyncio.sleep(0.5 * (attempt + 1))
 
-    if not answer:
-        return "The LLM did not return an answer."
-
-    return answer.strip()
+    raise RuntimeError("The LLM did not return an answer after retries")
 
 
 # ============================================================
-# RUN ONE STRATEGY
+# RUN ONE CHUNKING STRATEGY
 # ============================================================
 
 async def run_strategy(
@@ -173,89 +310,60 @@ async def run_strategy(
     rerank_top_k: int = RERANK_TOP_K,
     context_window: int = CONTEXT_WINDOW,
 ) -> dict:
-    """
-    Run the complete RAG pipeline for one chunking strategy.
-
-    Pipeline:
-
-        Query
-          ↓
-        Semantic Search
-          ↓
-        Cross-Encoder Reranking
-          ↓
-        Context Expansion
-          ↓
-        Context Construction
-          ↓
-        Groq LLM
-          ↓
-        Answer
-    """
+    """Execute the complete RAG pipeline for one strategy."""
 
     print("\n" + "=" * 80)
     print(f"RUNNING STRATEGY: {strategy}")
     print("=" * 80)
 
-    # --------------------------------------------------------
-    # 1. Semantic Retrieval
-    # --------------------------------------------------------
+    start_time = time.perf_counter()
 
+    # 1. Semantic Search
     results = await semantic_search(
         query=query,
         top_k=semantic_top_k,
         strategy=strategy,
     )
 
-    print(
-        f"\nSemantic candidates retrieved: {len(results)}"
-    )
+    print(f"Semantic candidates retrieved: {len(results)}")
 
-    # --------------------------------------------------------
-    # 2. Reranking
-    # --------------------------------------------------------
-
+    # 2. Cross-Encoder Reranking
     reranked_results = rerank_results(
         query=query,
         results=results,
         top_k=rerank_top_k,
     )
 
-    print(
-        f"Reranked candidates: {len(reranked_results)}"
-    )
+    print(f"Reranked candidates: {len(reranked_results)}")
 
-    # --------------------------------------------------------
     # 3. Context Expansion
-    # --------------------------------------------------------
-
     expanded_chunks = await expand_context(
         retrieved_chunks=reranked_results,
         window=context_window,
     )
 
-    print(
-        f"Expanded context chunks: {len(expanded_chunks)}"
+    print(f"Expanded context chunks: {len(expanded_chunks)}")
+
+    # 4. Context Selection
+    selected_chunks = select_context(
+        chunks=expanded_chunks,
+        max_chunks=MAX_CONTEXT_CHUNKS,
     )
 
-    # --------------------------------------------------------
-    # 4. Build Context
-    # --------------------------------------------------------
+    print(f"Selected context chunks: {len(selected_chunks)}")
 
-    context = build_context(expanded_chunks)
+    # 5. Build Context
+    context = build_context(selected_chunks)
 
-    # --------------------------------------------------------
-    # 5. Generate Final Answer
-    # --------------------------------------------------------
-
+    # 6. Generate Answer
     answer = await generate_answer(
         query=query,
         context=context,
     )
 
-    # --------------------------------------------------------
-    # Return complete result
-    # --------------------------------------------------------
+    duration = time.perf_counter() - start_time
+
+    print(f"Strategy duration: {duration:.2f} seconds")
 
     return {
         "strategy": strategy,
@@ -263,8 +371,10 @@ async def run_strategy(
         "semantic_results": results,
         "reranked_results": reranked_results,
         "expanded_chunks": expanded_chunks,
+        "selected_chunks": selected_chunks,
         "context": context,
         "answer": answer,
+        "duration_seconds": round(duration, 3),
     }
 
 
@@ -278,15 +388,11 @@ async def run_all_strategies(
     rerank_top_k: int = RERANK_TOP_K,
     context_window: int = CONTEXT_WINDOW,
 ) -> dict:
-    """
-    Run the RAG pipeline independently for all three
-    chunking strategies.
-    """
+    """Run the pipeline independently for every chunking strategy."""
 
     all_results = {}
 
     for strategy in STRATEGIES:
-
         result = await run_strategy(
             query=query,
             strategy=strategy,
@@ -301,21 +407,17 @@ async def run_all_strategies(
 
 
 # ============================================================
-# DISPLAY RESULTS
+# DISPLAY FINAL RESULTS
 # ============================================================
 
 def display_results(results: dict) -> None:
-    """
-    Display the final answer from each chunking strategy.
-    """
+    """Display retrieval counts and final answers."""
 
-    print("\n\n")
-    print("=" * 80)
+    print("\n\n" + "=" * 80)
     print("FINAL RAG RESULTS")
     print("=" * 80)
 
     for strategy in STRATEGIES:
-
         result = results.get(strategy)
 
         if not result:
@@ -325,159 +427,116 @@ def display_results(results: dict) -> None:
         print(f"STRATEGY: {strategy}")
         print("=" * 80)
 
-        print("\nQUERY:")
-        print(result["query"])
+        print(f"\nQuery: {result['query']}")
+        print(f"Semantic candidates: {len(result['semantic_results'])}")
+        print(f"Reranked candidates: {len(result['reranked_results'])}")
+        print(f"Expanded chunks: {len(result['expanded_chunks'])}")
+        print(f"Selected chunks: {len(result['selected_chunks'])}")
 
-        print("\nSEMANTIC CANDIDATES:")
-        print(len(result["semantic_results"]))
-
-        print("\nRERANKED CANDIDATES:")
-        print(len(result["reranked_results"]))
-
-        print("\nEXPANDED CONTEXT CHUNKS:")
-        print(len(result["expanded_chunks"]))
-
-        print("\nFINAL ANSWER:")
+        print("\nFINAL ANSWER")
         print("-" * 80)
         print(result["answer"])
         print("-" * 80)
 
 
 # ============================================================
-# OPTIONAL: DISPLAY RERANKED RESULTS
-# ============================================================
-
-def display_reranked_results(
-    results: dict,
-    max_results: int = 5
-) -> None:
-    """
-    Display the chunks selected by the cross-encoder.
-    Useful for debugging and demonstrating the retrieval
-    pipeline.
-    """
-
-    for strategy in STRATEGIES:
-
-        result = results.get(strategy)
-
-        if not result:
-            continue
-
-        print("\n" + "=" * 80)
-        print(f"RERANKED RESULTS: {strategy}")
-        print("=" * 80)
-
-        reranked = result["reranked_results"]
-
-        for index, chunk in enumerate(
-            reranked[:max_results],
-            start=1
-        ):
-
-            print(f"\nRESULT {index}")
-            print("-" * 80)
-
-            print(
-                f"Chunk ID       : "
-                f"{chunk.get('chunk_id', 'N/A')}"
-            )
-
-            print(
-                f"Strategy       : "
-                f"{chunk.get('strategy', 'N/A')}"
-            )
-
-            if "similarity" in chunk:
-                print(
-                    f"Semantic Score : "
-                    f"{chunk['similarity']:.4f}"
-                )
-
-            if "rerank_score" in chunk:
-                print(
-                    f"Rerank Score   : "
-                    f"{chunk['rerank_score']:.4f}"
-                )
-
-            print(
-                f"Section        : "
-                f"{chunk.get('section', 'N/A')}"
-            )
-
-            print("\nContent:")
-            print(chunk.get("content", ""))
-
-
-# ============================================================
-# MAIN
+# BATCH TESTING
 # ============================================================
 
 async def main():
-
     print("=" * 80)
-    print("DOCUMENT RAG PIPELINE")
+    print("DOCUMENT RAG PIPELINE - BATCH TESTING")
     print("=" * 80)
 
-    print("\nLLM:")
-    print(f"Groq - {GROQ_MODEL}")
+    print(f"LLM: Groq - {GROQ_MODEL}")
+    print("Strategies: " + ", ".join(STRATEGIES))
+    print(f"Output folder: {OUTPUT_DIR}")
 
-    print("\nChunking strategies:")
-    for strategy in STRATEGIES:
-        print(f"  - {strategy}")
+    print("\nEnter your questions, one per line.")
+    print("Press Enter on an empty line to start testing.\n")
 
-    print("\nPipeline:")
-    print("  Semantic Search")
-    print("       ↓")
-    print("  Cross-Encoder Reranking")
-    print("       ↓")
-    print("  Context Expansion")
-    print("       ↓")
-    print("  Groq LLM")
-    print("       ↓")
-    print("  Final Answer")
+    queries = []
 
-    print("\n" + "=" * 80)
+    while True:
+        query = input(f"Question {len(queries) + 1}: ").strip()
 
-    query = input(
-        "\nEnter your question about the document: "
-    ).strip()
+        if not query:
+            break
 
-    if not query:
-        print("\nNo question entered. Exiting.")
+        queries.append(query)
+
+    if not queries:
+        print("No questions entered. Exiting.")
         return
 
-    print("\n")
-    print("=" * 80)
-    print("QUERY")
-    print("=" * 80)
-    print(query)
+    print(f"\nTotal questions to test: {len(queries)}")
+    print(f"Maximum strategy runs: {len(queries) * len(STRATEGIES)}")
 
-    # --------------------------------------------------------
-    # Run all three strategies
-    # --------------------------------------------------------
+    all_results = {}
+    errors = []
 
-    results = await run_all_strategies(
-        query=query,
-        semantic_top_k=SEMANTIC_TOP_K,
-        rerank_top_k=RERANK_TOP_K,
-        context_window=CONTEXT_WINDOW,
-    )
+    # Create output files immediately, before the lengthy batch begins.
+    save_results(all_results, errors)
 
-    # --------------------------------------------------------
-    # Display final answers
-    # --------------------------------------------------------
+    for index, query in enumerate(queries, start=1):
+        print("\n\n" + "#" * 80)
+        print(f"QUESTION {index}/{len(queries)}: {query}")
+        print("#" * 80)
 
-    display_results(results)
+        all_results[query] = {}
+
+        for strategy in STRATEGIES:
+            try:
+                result = await run_strategy(
+                    query=query,
+                    strategy=strategy,
+                )
+
+                all_results[query][strategy] = result
+
+                # Save immediately after each successful strategy.
+                save_results(all_results, errors)
+
+            except Exception as error:
+                error_message = (
+                    f"Question {index}, strategy '{strategy}': "
+                    f"{type(error).__name__}: {error}"
+                )
+
+                print(f"\n[ERROR] {error_message}")
+
+                errors.append({
+                    "question": query,
+                    "strategy": strategy,
+                    "error": error_message,
+                })
+
+                # Persist the error and any completed answers.
+                try:
+                    save_results(all_results, errors)
+                except Exception as save_error:
+                    print(f"[SAVE ERROR] {save_error}")
+
+                print("Continuing with the next strategy.")
+
+        # Show whichever strategies completed successfully.
+        display_results(all_results[query])
+
+        # Save again after finishing this question.
+        try:
+            save_results(all_results, errors)
+        except Exception as save_error:
+            print(f"[SAVE ERROR] {save_error}")
 
     print("\n" + "=" * 80)
-    print("RAG PIPELINE COMPLETED")
+    print("BATCH TESTING COMPLETED")
+    print(f"Questions submitted: {len(queries)}")
+    print(f"Questions with saved results: {len(all_results)}")
+    print(f"Errors recorded: {len(errors)}")
+    print(f"JSON file: {JSON_PATH}")
+    print(f"CSV file: {CSV_PATH}")
     print("=" * 80)
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     asyncio.run(main())
